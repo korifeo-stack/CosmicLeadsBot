@@ -28,14 +28,15 @@ class UserSession:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@aicosmicnews")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
 PDF_PATH = os.getenv("PDF_PATH")
 PDF_URL = os.getenv("PDF_URL")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
-if not ADMIN_CHAT_ID:
-    raise RuntimeError("ADMIN_CHAT_ID is required")
+if not (ADMIN_CHAT_ID or ADMIN_PASSWORD):
+    raise RuntimeError("Set ADMIN_CHAT_ID or ADMIN_PASSWORD")
 if not (PDF_PATH or PDF_URL):
     raise RuntimeError("Set PDF_PATH or PDF_URL")
 
@@ -45,6 +46,7 @@ if PDF_PATH and not Path(PDF_PATH).exists():
 
 dp = Dispatcher()
 sessions: Dict[int, UserSession] = {}
+resolved_admin_chat_id: Optional[int] = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else None
 
 
 START_TEXT = (
@@ -107,6 +109,23 @@ def get_session(user_id: int) -> UserSession:
     return sessions[user_id]
 
 
+
+def is_admin_password_message(message: Message) -> bool:
+    return bool(ADMIN_PASSWORD and message.text and message.text.strip() == ADMIN_PASSWORD)
+
+
+async def try_bind_admin(message: Message, bot: Bot) -> bool:
+    global resolved_admin_chat_id
+    if not is_admin_password_message(message):
+        return False
+
+    resolved_admin_chat_id = message.from_user.id
+    await message.answer(
+        f"✅ Админ-пароль принят. Теперь уведомления будут отправляться сюда (chat_id={resolved_admin_chat_id})."
+    )
+    return True
+
+
 def format_user_display(message: Message) -> str:
     user = message.from_user
     if not user:
@@ -131,7 +150,10 @@ async def notify_admin(bot: Bot, message: Message, event_name: str, source: str,
         f"🕒 time: {datetime.now(timezone.utc).isoformat()}\n"
         f"📝 payload: {payload}"
     )
-    await bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=admin_text)
+    if resolved_admin_chat_id is None:
+        logger.warning("Admin chat is not configured yet; skip event %s", event_name)
+        return
+    await bot.send_message(chat_id=resolved_admin_chat_id, text=admin_text)
 
 
 async def notify_error(bot: Bot, message: Message, error_text: str) -> None:
@@ -160,6 +182,9 @@ async def on_start(message: Message, bot: Bot) -> None:
     session = get_session(message.from_user.id)
     session.source = param
     session.waiting_for = None
+
+    if await try_bind_admin(message, bot):
+        return
 
     await message.answer(START_TEXT, reply_markup=sub_keyboard())
     await notify_admin(bot, message, "start", session.source, "command=/start")
@@ -244,6 +269,9 @@ async def on_want_demo(callback: CallbackQuery, bot: Bot) -> None:
 
 @dp.message(F.text)
 async def on_text(message: Message, bot: Bot) -> None:
+    if await try_bind_admin(message, bot):
+        return
+
     session = get_session(message.from_user.id)
     if session.waiting_for == "dashboard_request_text":
         await notify_admin(bot, message, "dashboard_request_text", session.source, message.text)
