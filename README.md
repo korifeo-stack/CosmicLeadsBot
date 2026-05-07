@@ -64,3 +64,51 @@ python bot.py
 🎁 Нажми /start 🚀 — выдам PDF «Контроль сервиса за 10 минут в день».
 /help ⚙️
 ```
+
+---
+
+## Site lead integration · POST /api/site-lead
+
+Добавлен HTTP-endpoint, чтобы заявки с лендинга `cosmicmind.ru` прилетали в этот же чат админа в едином формате.
+
+**Endpoint:** `POST http://127.0.0.1:8001/api/site-lead`
+
+**Headers:**
+- `Content-Type: application/json`
+- `X-Site-Token: <SITE_LEAD_TOKEN>` — должен совпадать с `.env` бота
+
+**Body (JSON):**
+```json
+{
+  "name":    "Иван",
+  "phone":   "+7 999 000-00-00",
+  "company": "Tokyo-City",
+  "size":    "6–15",
+  "source":  "hero_primary",
+  "page":    "/",
+  "ts":      "2026-05-07T18:30:00Z"
+}
+```
+
+**Ответ:**
+- `200 OK` → `{"ok": true}` — заявка ушла в чат админа (форматом «🛎 Заявка с лендинга»)
+- `400` — нет name/phone
+- `401` — неверный X-Site-Token
+- `503` — `ADMIN_CHAT_ID` ещё не настроен (напиши боту пароль через `ADMIN_PASSWORD` или впиши в .env)
+
+### Конфигурация
+
+В `.env`:
+```bash
+SITE_LEAD_HOST=127.0.0.1   # bind только на localhost — наружу не отдаём
+SITE_LEAD_PORT=8001
+SITE_LEAD_TOKEN=<openssl rand -hex 32>
+```
+
+Тот же `SITE_LEAD_TOKEN` нужно прописать в `.env` лендинга (см. `siteCosmic` репо). Лендинг шлёт сюда → бот шлёт в Telegram → админ.
+
+**Health check:**
+```bash
+curl http://127.0.0.1:8001/api/health
+# {"ok":true,"admin_configured":true,"site_token_set":true}
+```

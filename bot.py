@@ -1,12 +1,15 @@
 import asyncio
+import hmac
 import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import escape as html_escape
 from pathlib import Path
 from typing import Dict, Optional
 
 from aiogram import Bot, Dispatcher, F
+from aiohttp import web
 from dotenv import load_dotenv
 from aiogram.enums import ChatMemberStatus, ParseMode
 from aiogram.filters import CommandStart
@@ -32,6 +35,11 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
 PDF_PATH = os.getenv("PDF_PATH")
 PDF_URL = os.getenv("PDF_URL")
+
+# ── Site → bot HTTP integration ──
+SITE_LEAD_HOST  = os.getenv("SITE_LEAD_HOST", "127.0.0.1")
+SITE_LEAD_PORT  = int(os.getenv("SITE_LEAD_PORT", "8001"))
+SITE_LEAD_TOKEN = os.getenv("SITE_LEAD_TOKEN", "").strip()  # обязательно для прода
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -163,6 +171,81 @@ async def notify_error(bot: Bot, message: Message, error_text: str) -> None:
         logger.exception("Unable to send error to admin: %s", exc)
 
 
+# ──────────────────────────────────────────────────────────────
+# Site → bot integration: HTTP endpoint POST /api/site-lead
+# ──────────────────────────────────────────────────────────────
+def format_site_lead(payload: dict) -> str:
+    """HTML message for admin chat (used with parse_mode=HTML)."""
+    def f(v: object) -> str:
+        return html_escape(str(v if v not in (None, "") else "—"))
+
+    lines = [
+        "🛎  <b>Заявка с лендинга · CosmicMind</b>",
+        "",
+        f"<b>Имя:</b>      {f(payload.get('name'))}",
+        f"<b>Телефон:</b>  {f(payload.get('phone'))}",
+        f"<b>Сеть:</b>     {f(payload.get('company'))}",
+        f"<b>Размер:</b>   {f(payload.get('size'))} точек",
+    ]
+    src = payload.get("source")
+    if src:    lines.append(f"<b>CTA:</b>      {f(src)}")
+    page = payload.get("page")
+    if page:   lines.append(f"<b>Страница:</b> {f(page)}")
+    ts = payload.get("ts") or datetime.now(timezone.utc).isoformat()
+    lines.append(f"<b>Время:</b>    {f(ts)}")
+    utm = payload.get("utm")
+    if utm:    lines.append(f"<b>UTM:</b>      {f(utm)}")
+    return "\n".join(lines)
+
+
+async def site_lead_handler(request: web.Request) -> web.Response:
+    """Принимает заявки с лендинга (server.js → этот endpoint).
+
+    Авторизация — header `X-Site-Token` должен совпадать с SITE_LEAD_TOKEN.
+    """
+    bot: Bot = request.app["bot"]
+
+    # Auth
+    if SITE_LEAD_TOKEN:
+        sent = request.headers.get("X-Site-Token", "")
+        if not hmac.compare_digest(sent, SITE_LEAD_TOKEN):
+            logger.warning("site-lead unauthorized: client=%s", request.remote)
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    # Body
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    name  = str(payload.get("name") or "").strip()
+    phone = str(payload.get("phone") or "").strip()
+    if not name or not phone:
+        return web.json_response({"ok": False, "error": "name and phone are required"}, status=400)
+
+    if resolved_admin_chat_id is None:
+        logger.warning("site-lead got data but ADMIN_CHAT_ID not set yet; payload=%s", payload)
+        return web.json_response({"ok": False, "error": "admin chat not configured"}, status=503)
+
+    text = format_site_lead(payload)
+    try:
+        await bot.send_message(chat_id=resolved_admin_chat_id, text=text)
+        logger.info("site-lead delivered: name=%s phone=%s source=%s", name, phone, payload.get("source"))
+    except Exception as exc:
+        logger.exception("site-lead delivery failed: %s", exc)
+        return web.json_response({"ok": False, "error": str(exc)}, status=502)
+
+    return web.json_response({"ok": True})
+
+
+async def health_handler(_request: web.Request) -> web.Response:
+    return web.json_response({
+        "ok": True,
+        "admin_configured": resolved_admin_chat_id is not None,
+        "site_token_set": bool(SITE_LEAD_TOKEN),
+    })
+
+
 async def send_pdf(bot: Bot, chat_id: int) -> None:
     if PDF_URL:
         await bot.send_document(chat_id=chat_id, document=URLInputFile(PDF_URL))
@@ -283,9 +366,30 @@ async def on_text(message: Message, bot: Bot) -> None:
         await message.answer("Спасибо! ✅ Передал запрос, свяжемся.")
 
 
+# ──────────────────────────────────────────────────────────────
+# Run polling + aiohttp web server side-by-side.
+# ──────────────────────────────────────────────────────────────
+async def start_web_server(bot: Bot) -> web.AppRunner:
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_post("/api/site-lead", site_lead_handler)
+    app.router.add_get("/api/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, SITE_LEAD_HOST, SITE_LEAD_PORT)
+    await site.start()
+    logger.info("Site-lead HTTP listener on %s:%s (token_required=%s)",
+                SITE_LEAD_HOST, SITE_LEAD_PORT, bool(SITE_LEAD_TOKEN))
+    return runner
+
+
 async def main() -> None:
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    await dp.start_polling(bot)
+    runner = await start_web_server(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
